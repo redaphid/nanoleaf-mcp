@@ -1,6 +1,6 @@
 {
   "name": "nanoleaf-mcp",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "description": "MCP server for controlling Nanoleaf light panels",
   "type": "module",
   "main": "dist/index.js",

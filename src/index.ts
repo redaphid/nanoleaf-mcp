@@ -13,6 +13,8 @@ import {
   discoverDevicesScan,
   type RGBColor,
 } from "./nanoleaf-client.js";
+import { DeviceManager } from "./device-manager.js";
+import { createRestApi } from "./rest-api.js";
 
 // Enable CSS color names support (type assertion needed due to CJS/ESM interop)
 extend([names as unknown as Parameters<typeof extend>[0][number]]);
@@ -30,23 +32,37 @@ function parseColor(color: string): { hue: number; saturation: number; brightnes
   };
 }
 
-const NANOLEAF_IP = process.env.NANOLEAF_IP || "";
-const NANOLEAF_AUTH_TOKEN = process.env.NANOLEAF_AUTH_TOKEN || "";
 const PORT = parseInt(process.env.PORT || "3101", 10);
 
-let nanoleafClient: NanoleafClient | null = null;
+// ============================================
+// MULTI-DEVICE SETUP
+// ============================================
 
-if (NANOLEAF_IP && NANOLEAF_AUTH_TOKEN) {
-  nanoleafClient = new NanoleafClient(NANOLEAF_IP, NANOLEAF_AUTH_TOKEN);
+const deviceManager = new DeviceManager();
+
+const NANOLEAF_DEVICES = process.env.NANOLEAF_DEVICES;
+if (NANOLEAF_DEVICES) {
+  try {
+    const parsed = JSON.parse(NANOLEAF_DEVICES);
+    for (const d of parsed) {
+      if (d.ip && d.authToken) {
+        deviceManager.register(d.ip, d.authToken, d.alias);
+      }
+    }
+  } catch (e) {
+    console.error("Failed to parse NANOLEAF_DEVICES:", e);
+  }
 }
 
 // Accept both string and number panel IDs, always coerce to number
 const panelIdParam = (description: string) =>
   z.union([z.string(), z.number()]).transform((v) => Number(v)).describe(description);
 
+const deviceParam = z.string().optional().describe("Device alias or IP. Optional when only one device is registered.");
+
 const server = new McpServer({
   name: "nanoleaf-mcp",
-  version: "1.0.0",
+  version: "2.1.0",
 });
 
 // Helper for tool responses
@@ -56,11 +72,82 @@ const err = (error: any) => ({
   isError: true,
 });
 const json = (data: unknown) => ok(JSON.stringify(data, null, 2));
-const notConfigured = () =>
-  ok(
-    "Not configured. Set NANOLEAF_IP and NANOLEAF_AUTH_TOKEN environment variables, or use discover_devices and create_auth_token tools."
-  );
-const isConfigured = () => NANOLEAF_IP && NANOLEAF_AUTH_TOKEN && nanoleafClient;
+
+function resolveDevice(device?: string) {
+  const result = deviceManager.resolve(device);
+  if ("error" in result) return { error: ok(result.error) };
+  return result;
+}
+
+// ============================================
+// DEVICE MANAGEMENT TOOLS
+// ============================================
+
+server.registerTool("list_devices", {
+  title: "List Devices",
+  description: "Show all registered Nanoleaf devices with alias, IP, name, model, and power status.",
+}, async () => {
+  const devices = deviceManager.listAll();
+  if (devices.length === 0) {
+    return ok("No devices registered. Use add_device or set NANOLEAF_DEVICES env var.");
+  }
+  const lines: string[] = [];
+  for (const d of devices) {
+    let status = "unknown";
+    try {
+      const info = await d.client.getInfo();
+      status = info.state.on.value ? "on" : "off";
+    } catch {
+      status = "unreachable";
+    }
+    lines.push(
+      `${d.alias} — ${d.ip} — ${d.name || "?"} (${d.model || "?"}) — ${status}`
+    );
+  }
+  return ok(`Registered devices:\n${lines.join("\n")}`);
+});
+
+server.registerTool("add_device", {
+  title: "Add Device",
+  description:
+    "Register a Nanoleaf device at runtime. Verifies connection first. Alias defaults to hardware name if reachable.",
+  inputSchema: z.object({
+    ip: z.string().describe("IP address of the Nanoleaf device"),
+    authToken: z.string().describe("Auth token for the device"),
+    alias: z.string().optional().describe("Friendly name for the device. Defaults to hardware name or IP."),
+  }),
+}, async ({ ip, authToken, alias }) => {
+  // Verify connection
+  try {
+    const testClient = new NanoleafClient(ip, authToken);
+    const info = await testClient.getInfo();
+    const finalAlias = alias || info.name || ip;
+    if (deviceManager.has(finalAlias)) {
+      return ok(`A device with alias "${finalAlias}" is already registered. Use a different alias.`);
+    }
+    const device = deviceManager.register(ip, authToken, finalAlias);
+    device.name = info.name;
+    device.model = info.model;
+    return ok(
+      `Device registered as "${device.alias}" — ${info.name} (${info.model}) at ${ip}`
+    );
+  } catch (e: any) {
+    return err({ message: `Cannot connect to ${ip}: ${e.message || e}` });
+  }
+});
+
+server.registerTool("remove_device", {
+  title: "Remove Device",
+  description: "Unregister a Nanoleaf device by alias.",
+  inputSchema: z.object({
+    alias: z.string().describe("The alias of the device to remove"),
+  }),
+}, async ({ alias }) => {
+  if (deviceManager.remove(alias)) {
+    return ok(`Device "${alias}" removed.`);
+  }
+  return ok(`Device "${alias}" not found.`);
+});
 
 // ============================================
 // DEVICE INFO TOOLS
@@ -70,10 +157,12 @@ server.registerTool("get_device_info", {
   title: "Get Device Info",
   description:
     "Get detailed information about the Nanoleaf device including name, model, firmware version, and current state. Call this first to verify your connection and see device capabilities.",
-}, async () => {
-  if (!isConfigured()) return notConfigured();
+  inputSchema: z.object({ device: deviceParam }),
+}, async ({ device }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    return json(await nanoleafClient!.getInfo());
+    return json(await resolved.client.getInfo());
   } catch (e) {
     return err(e);
   }
@@ -83,10 +172,12 @@ server.registerTool("get_panel_layout", {
   title: "Get Panel Layout",
   description:
     "Get the physical layout of all panels including their positions and IDs. IMPORTANT: You need panel IDs from this response before using set_panel_colors or stream_panel_colors.",
-}, async () => {
-  if (!isConfigured()) return notConfigured();
+  inputSchema: z.object({ device: deviceParam }),
+}, async ({ device }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    return json(await nanoleafClient!.getPanelLayout());
+    return json(await resolved.client.getPanelLayout());
   } catch (e) {
     return err(e);
   }
@@ -99,10 +190,12 @@ server.registerTool("get_panel_layout", {
 server.registerTool("turn_on", {
   title: "Turn On",
   description: "Turn on the Nanoleaf device",
-}, async () => {
-  if (!isConfigured()) return notConfigured();
+  inputSchema: z.object({ device: deviceParam }),
+}, async ({ device }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.turnOn();
+    await resolved.client.turnOn();
     return ok("Nanoleaf turned on");
   } catch (e) {
     return err(e);
@@ -112,10 +205,12 @@ server.registerTool("turn_on", {
 server.registerTool("turn_off", {
   title: "Turn Off",
   description: "Turn off the Nanoleaf device",
-}, async () => {
-  if (!isConfigured()) return notConfigured();
+  inputSchema: z.object({ device: deviceParam }),
+}, async ({ device }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.turnOff();
+    await resolved.client.turnOff();
     return ok("Nanoleaf turned off");
   } catch (e) {
     return err(e);
@@ -135,16 +230,18 @@ server.registerTool("set_brightness", {
 <example>Set to dim (25%): brightness=25</example>
 <example>Set to very dim (10%): brightness=10</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     brightness: z.coerce
       .number()
       .min(0)
       .max(100)
       .describe("Brightness value (0-100). <example>100</example> <example>50</example> <example>25</example>"),
   }),
-}, async ({ brightness }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, brightness }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.setBrightness(brightness);
+    await resolved.client.setBrightness(brightness);
     return ok(`Brightness set to ${brightness}%`);
   } catch (e) {
     return err(e);
@@ -164,16 +261,18 @@ server.registerTool("set_hue", {
 <example>Set to blue: hue=240</example>
 <example>Set to yellow: hue=60</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     hue: z.coerce
       .number()
       .min(0)
       .max(360)
       .describe("Hue value (0-360, where 0=red, 120=green, 240=blue). <example>0</example> <example>120</example> <example>240</example>"),
   }),
-}, async ({ hue }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, hue }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.setHue(hue);
+    await resolved.client.setHue(hue);
     return ok(`Hue set to ${hue}`);
   } catch (e) {
     return err(e);
@@ -188,16 +287,18 @@ server.registerTool("set_saturation", {
 <example>Set pastel (50%): saturation=50</example>
 <example>Set near-white: saturation=10</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     saturation: z.coerce
       .number()
       .min(0)
       .max(100)
       .describe("Saturation value (0=white, 100=full color). <example>100</example> <example>50</example> <example>0</example>"),
   }),
-}, async ({ saturation }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, saturation }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.setSaturation(saturation);
+    await resolved.client.setSaturation(saturation);
     return ok(`Saturation set to ${saturation}%`);
   } catch (e) {
     return err(e);
@@ -219,14 +320,16 @@ Accepts any CSS color format: named colors, hex, rgb(), hsl(), etc. The alpha ch
 <example>Set to pink: color="pink"</example>
 <example>Set to dim red for movie night: color="rgba(255,0,0,0.2)"</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     color: z.string().describe('Required. Any CSS color. Use alpha (0-1) to control brightness. <example>"red"</example> <example>"#ff0000"</example> <example>"rgb(255,0,0)"</example> <example>"rgba(255,0,0,0.5)"</example> <example>"hsl(0,100%,50%)"</example> <example>"hsla(240,100%,50%,0.75)"</example> <example>"pink"</example>'),
   }),
-}, async ({ color }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, color }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   const parsed = parseColor(color);
   if (!parsed) return err({ message: `Invalid color: "${color}". Use CSS colors like "red", "#ff0000", "rgb(255,0,0)", or "hsl(0,100%,50%)"` });
   try {
-    await nanoleafClient!.setState({
+    await resolved.client.setState({
       on: true,
       hue: parsed.hue,
       saturation: parsed.saturation,
@@ -246,14 +349,16 @@ server.registerTool("set_color_rgb", {
 <example>Set to green: r=0, g=255, b=0</example>
 <example>Set to white: r=255, g=255, b=255</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     r: z.coerce.number().min(0).max(255).describe("Red value (0-255). <example>255</example> <example>0</example>"),
     g: z.coerce.number().min(0).max(255).describe("Green value (0-255). <example>255</example> <example>0</example>"),
     b: z.coerce.number().min(0).max(255).describe("Blue value (0-255). <example>255</example> <example>0</example>"),
   }),
-}, async ({ r, g, b }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, r, g, b }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.setColor({ r, g, b });
+    await resolved.client.setColor({ r, g, b });
     return ok(`Color set to RGB(${r}, ${g}, ${b})`);
   } catch (e) {
     return err(e);
@@ -269,16 +374,18 @@ server.registerTool("set_color_temperature", {
 <example>Set neutral white: ct=4000</example>
 <example>Set cool daylight: ct=6500</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     ct: z.coerce
       .number()
       .min(1200)
       .max(6500)
       .describe("Color temperature in Kelvin (1200=warm candlelight, 6500=cool daylight). <example>1200</example> <example>2700</example> <example>4000</example> <example>6500</example>"),
   }),
-}, async ({ ct }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, ct }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.setColorTemperature(ct);
+    await resolved.client.setColorTemperature(ct);
     return ok(`Color temperature set to ${ct}K`);
   } catch (e) {
     return err(e);
@@ -296,6 +403,7 @@ You can pass a CSS color string via the "color" parameter, or use explicit hue/s
 <example>Set brightness and color temp: brightness=80, ct=2700</example>
 <example>Turn on at full brightness: on=true, brightness=100</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     on: z.boolean().optional().describe("Turn device on or off"),
     color: z.string().optional().describe('Optional CSS color. Alpha controls brightness. <example>"red"</example> <example>"rgba(255,0,0,0.5)"</example>'),
     brightness: z.coerce.number().min(0).max(100).optional().describe("Brightness (0-100). Overrides alpha from color if both provided."),
@@ -303,8 +411,9 @@ You can pass a CSS color string via the "color" parameter, or use explicit hue/s
     saturation: z.coerce.number().min(0).max(100).optional().describe("Saturation (0-100). Overrides saturation from color if both provided."),
     ct: z.coerce.number().min(1200).max(6500).optional().describe("Color temperature in Kelvin. <example>2700</example> <example>6500</example>"),
   }),
-}, async ({ on, color, brightness, hue, saturation, ct }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, on, color, brightness, hue, saturation, ct }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
     // Start with parsed CSS color if provided
     let parsedHue = hue;
@@ -317,7 +426,7 @@ You can pass a CSS color string via the "color" parameter, or use explicit hue/s
       if (parsedSat === undefined) parsedSat = parsed.saturation;
       if (parsedBri === undefined) parsedBri = parsed.brightness;
     }
-    await nanoleafClient!.setState({
+    await resolved.client.setState({
       on,
       brightness: parsedBri,
       hue: parsedHue,
@@ -337,10 +446,12 @@ You can pass a CSS color string via the "color" parameter, or use explicit hue/s
 server.registerTool("list_effects", {
   title: "List Effects",
   description: "Get a list of all available effects on the device. Call this first to get effect names before using set_effect.",
-}, async () => {
-  if (!isConfigured()) return notConfigured();
+  inputSchema: z.object({ device: deviceParam }),
+}, async ({ device }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    const effects = await nanoleafClient!.listEffects();
+    const effects = await resolved.client.listEffects();
     return ok(`Available effects:\n${effects.join("\n")}`);
   } catch (e) {
     return err(e);
@@ -350,10 +461,12 @@ server.registerTool("list_effects", {
 server.registerTool("get_current_effect", {
   title: "Get Current Effect",
   description: "Get the name of the currently active effect",
-}, async () => {
-  if (!isConfigured()) return notConfigured();
+  inputSchema: z.object({ device: deviceParam }),
+}, async ({ device }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    const effect = await nanoleafClient!.getCurrentEffect();
+    const effect = await resolved.client.getCurrentEffect();
     return ok(`Current effect: ${effect}`);
   } catch (e) {
     return err(e);
@@ -367,12 +480,14 @@ server.registerTool("set_effect", {
 <example>Activate an effect: effectName="Northern Lights"</example>
 <example>Activate an effect: effectName="Flames"</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     effectName: z.string().describe('The name of the effect to activate. Get names from list_effects. <example>"Northern Lights"</example> <example>"Flames"</example>'),
   }),
-}, async ({ effectName }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, effectName }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.setEffect(effectName);
+    await resolved.client.setEffect(effectName);
     return ok(`Effect "${effectName}" activated`);
   } catch (e) {
     return err(e);
@@ -389,6 +504,7 @@ server.registerTool("set_panel_colors", {
 
 <example>Set panel 1 to red and panel 2 to blue: panels=[{panelId: 1, r: 255, g: 0, b: 0}, {panelId: 2, r: 0, g: 0, b: 255}]</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     panels: z
       .array(
         z.object({
@@ -400,14 +516,15 @@ server.registerTool("set_panel_colors", {
       )
       .describe("Array of panel colors"),
   }),
-}, async ({ panels }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, panels }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
     const panelColors = new Map<number, RGBColor>();
     for (const panel of panels) {
       panelColors.set(panel.panelId, { r: panel.r, g: panel.g, b: panel.b });
     }
-    await nanoleafClient!.setPanelColors(panelColors);
+    await resolved.client.setPanelColors(panelColors);
     return ok(`Set colors for ${panels.length} panels`);
   } catch (e) {
     return err(e);
@@ -421,14 +538,16 @@ server.registerTool("set_solid_color", {
 <example>Set all panels to red: r=255, g=0, b=0</example>
 <example>Set all panels to warm white: r=255, g=244, b=229</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     r: z.coerce.number().min(0).max(255).describe("Red value (0-255). <example>255</example> <example>0</example>"),
     g: z.coerce.number().min(0).max(255).describe("Green value (0-255). <example>255</example> <example>0</example>"),
     b: z.coerce.number().min(0).max(255).describe("Blue value (0-255). <example>255</example> <example>0</example>"),
   }),
-}, async ({ r, g, b }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, r, g, b }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.setColor({ r, g, b });
+    await resolved.client.setColor({ r, g, b });
     return ok(`All panels set to RGB(${r}, ${g}, ${b})`);
   } catch (e) {
     return err(e);
@@ -443,10 +562,12 @@ server.registerTool("start_streaming", {
   title: "Start Streaming",
   description:
     "Initialize UDP streaming mode for real-time color updates. This enables low-latency per-panel control. Call this before using stream_solid_color or stream_panel_colors.",
-}, async () => {
-  if (!isConfigured()) return notConfigured();
+  inputSchema: z.object({ device: deviceParam }),
+}, async ({ device }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.initializeStreaming();
+    await resolved.client.initializeStreaming();
     return ok("Streaming mode initialized. Use stream_panel_colors or stream_solid_color for real-time updates.");
   } catch (e) {
     return err(e);
@@ -460,14 +581,16 @@ server.registerTool("stream_solid_color", {
 <example>Stream red: r=255, g=0, b=0</example>
 <example>Stream blue: r=0, g=0, b=255</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     r: z.coerce.number().min(0).max(255).describe("Red value (0-255)"),
     g: z.coerce.number().min(0).max(255).describe("Green value (0-255)"),
     b: z.coerce.number().min(0).max(255).describe("Blue value (0-255)"),
   }),
-}, async ({ r, g, b }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, r, g, b }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.streamSolidColor({ r, g, b });
+    await resolved.client.streamSolidColor({ r, g, b });
     return ok(`Streamed RGB(${r}, ${g}, ${b}) to all panels`);
   } catch (e) {
     return err(e);
@@ -480,6 +603,7 @@ server.registerTool("stream_panel_colors", {
 
 <example>Stream red to panel 1: panels=[{panelId: 1, r: 255, g: 0, b: 0}]</example>`,
   inputSchema: z.object({
+    device: deviceParam,
     panels: z
       .array(
         z.object({
@@ -491,14 +615,15 @@ server.registerTool("stream_panel_colors", {
       )
       .describe("Array of panel colors"),
   }),
-}, async ({ panels }) => {
-  if (!isConfigured()) return notConfigured();
+}, async ({ device, panels }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
     const panelColors = new Map<number, RGBColor>();
     for (const panel of panels) {
       panelColors.set(panel.panelId, { r: panel.r, g: panel.g, b: panel.b });
     }
-    await nanoleafClient!.streamColors(panelColors);
+    await resolved.client.streamColors(panelColors);
     return ok(`Streamed colors to ${panels.length} panels`);
   } catch (e) {
     return err(e);
@@ -508,10 +633,12 @@ server.registerTool("stream_panel_colors", {
 server.registerTool("stop_streaming", {
   title: "Stop Streaming",
   description: "Stop UDP streaming mode and close the socket",
-}, async () => {
-  if (!isConfigured()) return notConfigured();
+  inputSchema: z.object({ device: deviceParam }),
+}, async ({ device }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.stopStreaming();
+    await resolved.client.stopStreaming();
     return ok("Streaming mode stopped");
   } catch (e) {
     return err(e);
@@ -525,10 +652,12 @@ server.registerTool("stop_streaming", {
 server.registerTool("identify", {
   title: "Identify",
   description: "Flash the Nanoleaf device to help identify it physically",
-}, async () => {
-  if (!isConfigured()) return notConfigured();
+  inputSchema: z.object({ device: deviceParam }),
+}, async ({ device }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    await nanoleafClient!.identify();
+    await resolved.client.identify();
     return ok("Device is flashing to identify itself");
   } catch (e) {
     return err(e);
@@ -563,7 +692,7 @@ server.registerTool("discover_devices", {
         );
       }
       return ok(
-        `Found ${devices.length} Nanoleaf device(s):\n\n${JSON.stringify(devices, null, 2)}\n\nUse the IP address with create_auth_token to authenticate.`
+        `Found ${devices.length} Nanoleaf device(s):\n\n${JSON.stringify(devices, null, 2)}\n\nUse the IP address with create_auth_token to authenticate, then add_device to register.`
       );
     } else {
       const devices = await discoverDevicesScan(subnet);
@@ -573,7 +702,7 @@ server.registerTool("discover_devices", {
         );
       }
       return ok(
-        `Found ${devices.length} Nanoleaf device(s):\n\n${JSON.stringify(devices, null, 2)}\n\nUse the IP address with create_auth_token to authenticate.`
+        `Found ${devices.length} Nanoleaf device(s):\n\n${JSON.stringify(devices, null, 2)}\n\nUse the IP address with create_auth_token to authenticate, then add_device to register.`
       );
     }
   } catch (e) {
@@ -592,7 +721,7 @@ server.registerTool("create_auth_token", {
   try {
     const authToken = await NanoleafClient.createAuthToken(ip);
     return ok(
-      `Auth token created successfully!\n\nYour new auth token: ${authToken}\n\nSet these environment variables:\n  NANOLEAF_IP=${ip}\n  NANOLEAF_AUTH_TOKEN=${authToken}`
+      `Auth token created successfully!\n\nYour new auth token: ${authToken}\n\nTo use this device:\n  1. Call add_device with ip="${ip}" and authToken="${authToken}"\n  2. Or add to NANOLEAF_DEVICES env var:\n     [{"ip":"${ip}","authToken":"${authToken}","alias":"my-light"}]`
     );
   } catch (e: any) {
     if (e.response?.status === 403) {
@@ -606,18 +735,35 @@ server.registerTool("create_auth_token", {
 
 server.registerTool("test_connection", {
   title: "Test Connection",
-  description: "Test the connection to the Nanoleaf device with current credentials",
-}, async () => {
-  if (!NANOLEAF_IP || !NANOLEAF_AUTH_TOKEN) {
-    return ok(
-      `Not configured!\n\nMissing environment variables:\n${!NANOLEAF_IP ? "- NANOLEAF_IP\n" : ""}${!NANOLEAF_AUTH_TOKEN ? "- NANOLEAF_AUTH_TOKEN\n" : ""}\nUse discover_devices and create_auth_token to set up.`
-    );
+  description: "Test the connection to a Nanoleaf device. Specify a registered device by alias, or provide raw ip + authToken to test an unregistered device.",
+  inputSchema: z.object({
+    device: deviceParam,
+    ip: z.string().optional().describe("IP address to test (for unregistered devices)"),
+    authToken: z.string().optional().describe("Auth token to test (for unregistered devices)"),
+  }),
+}, async ({ device, ip, authToken }) => {
+  // If raw ip+authToken provided, test that directly
+  if (ip && authToken) {
+    try {
+      const testClient = new NanoleafClient(ip, authToken);
+      const info = await testClient.getInfo();
+      const layout = await testClient.getPanelLayout();
+      return ok(
+        `Connection successful!\n\nDevice: ${info.name}\nModel: ${info.model}\nFirmware: ${info.firmwareVersion}\nPanels: ${layout.numPanels}\nPower: ${info.state.on.value ? "On" : "Off"}\nBrightness: ${info.state.brightness.value}%\n\nUse add_device to register this device.`
+      );
+    } catch (e) {
+      return err(e);
+    }
   }
+
+  // Otherwise resolve a registered device
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
   try {
-    const info = await nanoleafClient!.getInfo();
-    const layout = await nanoleafClient!.getPanelLayout();
+    const info = await resolved.client.getInfo();
+    const layout = await resolved.client.getPanelLayout();
     return ok(
-      `Connection successful!\n\nDevice: ${info.name}\nModel: ${info.model}\nFirmware: ${info.firmwareVersion}\nPanels: ${layout.numPanels}\nPower: ${info.state.on.value ? "On" : "Off"}\nBrightness: ${info.state.brightness.value}%`
+      `Connection successful!\n\nAlias: ${resolved.device.alias}\nDevice: ${info.name}\nModel: ${info.model}\nFirmware: ${info.firmwareVersion}\nPanels: ${layout.numPanels}\nPower: ${info.state.on.value ? "On" : "Off"}\nBrightness: ${info.state.brightness.value}%`
     );
   } catch (e) {
     return err(e);
@@ -631,7 +777,15 @@ server.registerTool("test_connection", {
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
 async function main() {
+  // Fetch hardware names for devices loaded from env
+  if (deviceManager.size > 0) {
+    await deviceManager.refreshNames();
+  }
+
   const app = createMcpExpressApp({ host: "0.0.0.0" });
+
+  // Mount REST API
+  app.use("/api", createRestApi(deviceManager, parseColor));
 
   app.post("/mcp", async (req, res) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -687,11 +841,17 @@ async function main() {
 
   app.listen(PORT, () => {
     console.log(`Nanoleaf MCP server running on http://0.0.0.0:${PORT}/mcp`);
-    if (isConfigured()) {
-      console.log(`Connected to Nanoleaf at ${NANOLEAF_IP}`);
+    console.log(`REST API:   http://0.0.0.0:${PORT}/api`);
+    console.log(`Swagger UI: http://0.0.0.0:${PORT}/api/docs`);
+    const devices = deviceManager.listAll();
+    if (devices.length > 0) {
+      console.log(`Registered devices (${devices.length}):`);
+      for (const d of devices) {
+        console.log(`  ${d.alias} — ${d.ip}${d.name ? ` — ${d.name}` : ""}${d.model ? ` (${d.model})` : ""}`);
+      }
     } else {
       console.log(
-        "Not configured. Set NANOLEAF_IP and NANOLEAF_AUTH_TOKEN environment variables."
+        "No devices configured. Set NANOLEAF_DEVICES env var or use add_device at runtime."
       );
     }
   });
