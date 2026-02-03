@@ -84,6 +84,7 @@ export class NanoleafClient {
   private streamingSocket: dgram.Socket | null = null;
   private protocolVersion: 1 | 2 = 2;
   private panelIds: number[] = [];
+  private cachedLightPanelIds: number[] | null = null;
 
   constructor(ip: string, authToken: string) {
     this.ip = ip;
@@ -157,6 +158,43 @@ export class NanoleafClient {
     };
   }
 
+  // Get light panel IDs (cached, excludes controller panels with shapeType 12)
+  private async getLightPanelIds(): Promise<number[]> {
+    if (this.cachedLightPanelIds) return this.cachedLightPanelIds;
+    const layout = await this.getPanelLayout();
+    this.cachedLightPanelIds = layout.positions
+      .filter((p) => p.shapeType !== 12)
+      .map((p) => p.panelId);
+    return this.cachedLightPanelIds;
+  }
+
+  // Ensure the device is in static mode so state API calls are visible.
+  // If an animated effect is active, reads the current color and writes
+  // it as a static effect to all panels, preserving the visual state.
+  private async ensureStaticMode(): Promise<void> {
+    const info = await this.getInfo();
+    const effect = info.effects.select;
+    if (effect === "*Solid*" || effect === "*Static*") return;
+    // An animated effect is active — write current color as static to override it
+    const hsb: HSBColor = {
+      hue: info.state.hue.value,
+      saturation: info.state.sat.value,
+      brightness: info.state.brightness.value,
+    };
+    const rgb = this.hsbToRgb(hsb);
+    await this.setAllPanelsColor(rgb);
+  }
+
+  // Set all light panels to a single color via the effects write API
+  async setAllPanelsColor(color: RGBColor): Promise<void> {
+    const ids = await this.getLightPanelIds();
+    const panelColors = new Map<number, RGBColor>();
+    for (const id of ids) {
+      panelColors.set(id, color);
+    }
+    await this.setPanelColors(panelColors);
+  }
+
   async turnOn(): Promise<void> {
     await this.client.put("/state", { on: { value: true } });
   }
@@ -166,32 +204,31 @@ export class NanoleafClient {
   }
 
   async setBrightness(brightness: number): Promise<void> {
+    await this.ensureStaticMode();
     const value = Math.max(0, Math.min(100, brightness));
     await this.client.put("/state", { brightness: { value } });
   }
 
   async setHue(hue: number): Promise<void> {
+    await this.ensureStaticMode();
     const value = Math.max(0, Math.min(360, hue));
     await this.client.put("/state", { hue: { value } });
   }
 
   async setSaturation(saturation: number): Promise<void> {
+    await this.ensureStaticMode();
     const value = Math.max(0, Math.min(100, saturation));
     await this.client.put("/state", { sat: { value } });
   }
 
   async setColorTemperature(ct: number): Promise<void> {
+    await this.ensureStaticMode();
     const value = Math.max(1200, Math.min(6500, ct));
     await this.client.put("/state", { ct: { value } });
   }
 
   async setColor(color: RGBColor): Promise<void> {
-    const hsb = this.rgbToHsb(color);
-    await this.client.put("/state", {
-      hue: { value: hsb.hue },
-      sat: { value: hsb.saturation },
-      brightness: { value: hsb.brightness },
-    });
+    await this.setAllPanelsColor(color);
   }
 
   async setState(state: {
@@ -201,6 +238,7 @@ export class NanoleafClient {
     saturation?: number;
     ct?: number;
   }): Promise<void> {
+    await this.ensureStaticMode();
     const payload: Record<string, { value: number | boolean }> = {};
     if (state.on !== undefined) payload.on = { value: state.on };
     if (state.brightness !== undefined)
@@ -358,6 +396,34 @@ export class NanoleafClient {
       this.streamingSocket.close();
       this.streamingSocket = null;
     }
+  }
+
+  private hsbToRgb(color: HSBColor): RGBColor {
+    const h = color.hue / 360;
+    const s = color.saturation / 100;
+    const v = color.brightness / 100;
+
+    let r = 0, g = 0, b = 0;
+    const i = Math.floor(h * 6);
+    const f = h * 6 - i;
+    const p = v * (1 - s);
+    const q = v * (1 - f * s);
+    const t = v * (1 - (1 - f) * s);
+
+    switch (i % 6) {
+      case 0: r = v; g = t; b = p; break;
+      case 1: r = q; g = v; b = p; break;
+      case 2: r = p; g = v; b = t; break;
+      case 3: r = p; g = q; b = v; break;
+      case 4: r = t; g = p; b = v; break;
+      case 5: r = v; g = p; b = q; break;
+    }
+
+    return {
+      r: Math.round(r * 255),
+      g: Math.round(g * 255),
+      b: Math.round(b * 255),
+    };
   }
 
   private rgbToHsb(color: RGBColor): HSBColor {
