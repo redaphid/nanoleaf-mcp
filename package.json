@@ -3,11 +3,9 @@
   "version": "2.1.0",
   "description": "MCP server for controlling Nanoleaf light panels",
   "type": "module",
-  "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
-    "start": "tsx src/index.ts",
-    "dev": "tsx watch src/index.ts"
+    "start": "node src/index.ts",
+    "start:stdio": "node src/index.ts --stdio"
   },
   "keywords": [
     "mcp",
@@ -28,10 +26,7 @@
     "typescript": "^5.9.3",
     "zod": "^4.3.5"
   },
-  "devDependencies": {
-    "tsx": "^4.21.0"
-  },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=23.0.0"
   }
 }

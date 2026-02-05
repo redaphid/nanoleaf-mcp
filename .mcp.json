@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "nanoleaf": {
-      "type": "http",
-      "url": "http://localhost:3101/mcp"
+      "command": "node",
+      "args": ["src/index.ts", "--stdio"]
     }
   }
 }

@@ -1,10 +1,6 @@
 import "dotenv/config";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { randomUUID } from "node:crypto";
 import { colord, extend } from "colord";
 import names from "colord/plugins/names";
 import {
@@ -14,7 +10,6 @@ import {
   type RGBColor,
 } from "./nanoleaf-client.js";
 import { DeviceManager } from "./device-manager.js";
-import { createRestApi } from "./rest-api.js";
 
 // Enable CSS color names support (type assertion needed due to CJS/ESM interop)
 extend([names as unknown as Parameters<typeof extend>[0][number]]);
@@ -771,10 +766,8 @@ server.registerTool("test_connection", {
 });
 
 // ============================================
-// SERVER
+// START
 // ============================================
-
-const transports: Record<string, StreamableHTTPServerTransport> = {};
 
 async function main() {
   // Fetch hardware names for devices loaded from env
@@ -782,79 +775,13 @@ async function main() {
     await deviceManager.refreshNames();
   }
 
-  const app = createMcpExpressApp({ host: "0.0.0.0" });
-
-  // Mount REST API
-  app.use("/api", createRestApi(deviceManager, parseColor));
-
-  app.post("/mcp", async (req, res) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-    try {
-      if (sessionId && transports[sessionId]) {
-        await transports[sessionId].handleRequest(req, res, req.body);
-      } else if (!sessionId && isInitializeRequest(req.body)) {
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (sid) => {
-            transports[sid] = transport;
-          },
-        });
-        transport.onclose = () => {
-          if (transport.sessionId) delete transports[transport.sessionId];
-        };
-        await server.connect(transport);
-        await transport.handleRequest(req, res, req.body);
-      } else {
-        res.status(400).json({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "Bad Request: No valid session ID" },
-          id: null,
-        });
-      }
-    } catch {
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal server error" },
-          id: null,
-        });
-      }
-    }
-  });
-
-  app.get("/mcp", async (req, res) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (!sessionId || !transports[sessionId]) {
-      return res.status(400).send("Invalid or missing session ID");
-    }
-    await transports[sessionId].handleRequest(req, res);
-  });
-
-  app.delete("/mcp", async (req, res) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (!sessionId || !transports[sessionId]) {
-      return res.status(400).send("Invalid or missing session ID");
-    }
-    await transports[sessionId].handleRequest(req, res);
-  });
-
-  app.listen(PORT, () => {
-    console.log(`Nanoleaf MCP server running on http://0.0.0.0:${PORT}/mcp`);
-    console.log(`REST API:   http://0.0.0.0:${PORT}/api`);
-    console.log(`Swagger UI: http://0.0.0.0:${PORT}/api/docs`);
-    const devices = deviceManager.listAll();
-    if (devices.length > 0) {
-      console.log(`Registered devices (${devices.length}):`);
-      for (const d of devices) {
-        console.log(`  ${d.alias} — ${d.ip}${d.name ? ` — ${d.name}` : ""}${d.model ? ` (${d.model})` : ""}`);
-      }
-    } else {
-      console.log(
-        "No devices configured. Set NANOLEAF_DEVICES env var or use add_device at runtime."
-      );
-    }
-  });
+  if (process.argv.includes("--stdio")) {
+    const { startStdio } = await import("./stdio.ts");
+    await startStdio(server);
+  } else {
+    const { startHttp } = await import("./http.ts");
+    await startHttp(server, deviceManager, parseColor, PORT);
+  }
 }
 
 main().catch(console.error);
