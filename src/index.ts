@@ -8,8 +8,8 @@ import {
   discoverDevicesMdns,
   discoverDevicesScan,
   type RGBColor,
-} from "./nanoleaf-client.js";
-import { DeviceManager } from "./device-manager.js";
+} from "./nanoleaf-client.ts";
+import { DeviceManager } from "./device-manager.ts";
 
 // Enable CSS color names support (type assertion needed due to CJS/ESM interop)
 extend([names as unknown as Parameters<typeof extend>[0][number]]);

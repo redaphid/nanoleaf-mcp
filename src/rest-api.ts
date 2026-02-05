@@ -1,11 +1,11 @@
 import { Router, json, type Request, type Response } from "express";
-import { DeviceManager } from "./device-manager.js";
+import { DeviceManager } from "./device-manager.ts";
 import {
   NanoleafClient,
   discoverDevicesMdns,
   discoverDevicesScan,
   type RGBColor,
-} from "./nanoleaf-client.js";
+} from "./nanoleaf-client.ts";
 
 type ParseColor = (
   color: string

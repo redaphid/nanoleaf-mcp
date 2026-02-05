@@ -1,4 +1,4 @@
-import { NanoleafClient } from "./nanoleaf-client.js";
+import { NanoleafClient } from "./nanoleaf-client.ts";
 
 export interface RegisteredDevice {
   alias: string;

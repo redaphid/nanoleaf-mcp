@@ -2,9 +2,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
-import { createRestApi } from "./rest-api.js";
+import { createRestApi } from "./rest-api.ts";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { DeviceManager } from "./device-manager.js";
+import type { DeviceManager } from "./device-manager.ts";
 
 type ParseColor = (
   color: string
