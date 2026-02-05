@@ -77,6 +77,39 @@ export interface HSBColor {
   brightness: number;
 }
 
+// Plugin UUIDs for built-in animation styles
+export const PLUGIN_UUIDS = {
+  flow: "027842e4-e1d6-4a4c-a731-be74a1ebd4cf",
+  wheel: "6970681a-20b5-4c5e-8813-bdaebc4ee4fa",
+  fade: "b3fd723a-aae8-4c99-bf2b-087159e0ef53",
+  highlight: "70b7c636-6bf8-491f-89c1-f4103508d642",
+  random: "ba632d3e-9c2b-4413-a965-510c839b3f71",
+  explode: "713518c1-d560-47db-8991-de780af71d1e",
+} as const;
+
+export type AnimationStyle = keyof typeof PLUGIN_UUIDS;
+export type AnimationSpeed = "very_slow" | "slow" | "medium" | "fast" | "very_fast";
+export type AnimationDirection = "left" | "right";
+
+export interface AnimationOptions {
+  name: string;
+  style: AnimationStyle;
+  palette: HSBColor[];
+  speed?: AnimationSpeed;
+  direction?: AnimationDirection;
+  brightness?: number;
+  loop?: boolean;
+}
+
+// Speed mappings: transTime and delayTime in tenths of a second
+const SPEED_MAPPINGS: Record<AnimationSpeed, { transTime: number; delayTime: number }> = {
+  very_slow: { transTime: 100, delayTime: 100 },  // 10s transitions
+  slow: { transTime: 50, delayTime: 50 },          // 5s transitions
+  medium: { transTime: 25, delayTime: 25 },        // 2.5s transitions
+  fast: { transTime: 10, delayTime: 10 },          // 1s transitions
+  very_fast: { transTime: 3, delayTime: 3 },       // 0.3s transitions
+};
+
 export class NanoleafClient {
   private ip: string;
   private authToken: string;
@@ -264,6 +297,110 @@ export class NanoleafClient {
 
   async setEffect(effectName: string): Promise<void> {
     await this.client.put("/effects", { select: effectName });
+  }
+
+  // Create and activate a custom animation using plugin-based effects
+  async createAnimation(options: AnimationOptions): Promise<void> {
+    const { name, style, palette, speed = "medium", direction = "right", brightness = 100, loop = true } = options;
+    const pluginUuid = PLUGIN_UUIDS[style];
+    const timing = SPEED_MAPPINGS[speed];
+
+    // Build palette with probability (even distribution)
+    const paletteWithProb = palette.map((color) => ({
+      hue: color.hue,
+      saturation: color.saturation,
+      brightness: Math.round((color.brightness * brightness) / 100),
+      probability: Math.round(100 / palette.length),
+    }));
+
+    // Build plugin options based on style
+    const pluginOptions: Array<{ name: string; value: number | string | boolean }> = [];
+
+    // Direction options vary by plugin type
+    if (style === "flow" || style === "wheel") {
+      // Flow uses linDirection, wheel uses rotDirection
+      if (style === "flow") {
+        pluginOptions.push({ name: "linDirection", value: direction });
+      } else {
+        pluginOptions.push({ name: "rotDirection", value: direction === "right" ? "cw" : "ccw" });
+      }
+      // These plugins use single transTime value
+      pluginOptions.push({ name: "transTime", value: timing.transTime });
+    } else {
+      // Fade, highlight, random, explode use transTime and delayTime ranges
+      pluginOptions.push({ name: "transTime", value: timing.transTime });
+      pluginOptions.push({ name: "delayTime", value: timing.delayTime });
+    }
+
+    // Write the animation
+    await this.client.put("/effects", {
+      write: {
+        command: "add",
+        animName: name,
+        animType: "plugin",
+        pluginType: "color",
+        pluginUuid,
+        colorType: "HSB",
+        palette: paletteWithProb,
+        pluginOptions,
+        loop,
+      },
+    });
+
+    // Activate the animation
+    await this.setEffect(name);
+  }
+
+  // Display a temporary animation without saving it
+  async displayAnimation(options: Omit<AnimationOptions, "name">): Promise<void> {
+    const { style, palette, speed = "medium", direction = "right", brightness = 100 } = options;
+    const pluginUuid = PLUGIN_UUIDS[style];
+    const timing = SPEED_MAPPINGS[speed];
+
+    const paletteWithProb = palette.map((color) => ({
+      hue: color.hue,
+      saturation: color.saturation,
+      brightness: Math.round((color.brightness * brightness) / 100),
+      probability: Math.round(100 / palette.length),
+    }));
+
+    const pluginOptions: Array<{ name: string; value: number | string | boolean }> = [];
+
+    if (style === "flow" || style === "wheel") {
+      if (style === "flow") {
+        pluginOptions.push({ name: "linDirection", value: direction });
+      } else {
+        pluginOptions.push({ name: "rotDirection", value: direction === "right" ? "cw" : "ccw" });
+      }
+      pluginOptions.push({ name: "transTime", value: timing.transTime });
+    } else {
+      pluginOptions.push({ name: "transTime", value: timing.transTime });
+      pluginOptions.push({ name: "delayTime", value: timing.delayTime });
+    }
+
+    await this.client.put("/effects", {
+      write: {
+        command: "display",
+        animType: "plugin",
+        pluginType: "color",
+        pluginUuid,
+        colorType: "HSB",
+        palette: paletteWithProb,
+        pluginOptions,
+        loop: true,
+      },
+    });
+  }
+
+
+  // Delete a custom animation by name
+  async deleteAnimation(name: string): Promise<void> {
+    await this.client.put("/effects", {
+      write: {
+        command: "delete",
+        animName: name,
+      },
+    });
   }
 
   async setPanelColors(panelColors: Map<number, RGBColor>): Promise<void> {

@@ -8,6 +8,10 @@ import {
   discoverDevicesMdns,
   discoverDevicesScan,
   type RGBColor,
+  type HSBColor,
+  type AnimationStyle,
+  type AnimationSpeed,
+  type AnimationDirection,
 } from "./nanoleaf-client.ts";
 import { DeviceManager } from "./device-manager.ts";
 
@@ -25,6 +29,29 @@ function parseColor(color: string): { hue: number; saturation: number; brightnes
     saturation: Math.round(hsv.s),     // 0-100
     brightness: Math.round(c.alpha() * 100), // alpha → brightness 0-100
   };
+}
+
+// Parse CSS color to full HSB (brightness from V, not alpha)
+function parseColorToHSB(color: string): HSBColor | null {
+  const c = colord(color);
+  if (!c.isValid()) return null;
+  const hsv = c.toHsv();
+  return {
+    hue: Math.round(hsv.h),
+    saturation: Math.round(hsv.s),
+    brightness: Math.round(hsv.v),
+  };
+}
+
+// Parse array of CSS colors to HSB palette
+function parsePalette(colors: string[]): HSBColor[] | null {
+  const palette: HSBColor[] = [];
+  for (const color of colors) {
+    const hsb = parseColorToHSB(color);
+    if (!hsb) return null;
+    palette.push(hsb);
+  }
+  return palette;
 }
 
 const PORT = parseInt(process.env.PORT || "3101", 10);
@@ -484,6 +511,76 @@ server.registerTool("set_effect", {
   try {
     await resolved.client.setEffect(effectName);
     return ok(`Effect "${effectName}" activated`);
+  } catch (e) {
+    return err(e);
+  }
+});
+
+// ============================================
+// CUSTOM ANIMATION TOOLS
+// ============================================
+
+server.registerTool("create_animation", {
+  title: "Create Animation",
+  description: `Create and activate a custom animation on the Nanoleaf. The animation runs directly on the hardware — no external process needed.
+
+<example>"Gentle ocean waves" → style="flow", colors=["#006994","#00b4d8","#90e0ef","#0077b6"], speed="slow"</example>
+<example>"Fast party strobe" → style="random", colors=["red","magenta","yellow","cyan"], speed="fast"</example>
+<example>"Cozy fireplace" → style="fade", colors=["#ff4500","#ff6347","#ff8c00","#8b0000"], speed="slow"</example>
+<example>"Rainbow wheel" → style="wheel", colors=["red","orange","yellow","green","blue","purple"], speed="medium"</example>
+<example>"Breathing glow" → style="highlight", colors=["#4a0080","#8000ff","#bf40ff"], speed="very_slow"</example>`,
+  inputSchema: z.object({
+    device: deviceParam,
+    name: z.string().describe('Friendly name for this animation. <example>"Ocean Waves"</example> <example>"Party Mode"</example>'),
+    style: z.enum(["flow", "wheel", "fade", "highlight", "random", "explode"]).describe(`How the colors move across panels:
+- "flow" — colors roll smoothly in one direction (like a river)
+- "wheel" — colors rotate around the center
+- "fade" — panels gently crossfade between palette colors
+- "highlight" — one panel at a time lights up, others stay dim
+- "random" — panels randomly pick colors from the palette
+- "explode" — bursts of color radiate outward from random panels`),
+    colors: z.array(z.string()).min(2).max(16).describe('2-16 CSS colors that define the palette. Accepts any format: "red", "#ff0000", "rgb(255,0,0)", "hsl(0,100%,50%)". More colors = smoother gradients; fewer = more contrast. <example>["red","orange","yellow"]</example> <example>["#006994","#00b4d8","#90e0ef"]</example>'),
+    speed: z.enum(["very_slow", "slow", "medium", "fast", "very_fast"]).optional().describe('Animation speed. Default: "medium"'),
+    direction: z.enum(["left", "right"]).optional().describe('Flow/wheel direction. Default: "right"'),
+    brightness: z.coerce.number().min(0).max(100).optional().describe("Overall brightness 0-100. Default: 100"),
+  }),
+}, async ({ device, name, style, colors, speed, direction, brightness }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
+
+  const palette = parsePalette(colors);
+  if (!palette) {
+    return err({ message: `Invalid color in palette. Use CSS colors like "red", "#ff0000", "rgb(255,0,0)"` });
+  }
+
+  try {
+    await resolved.client.createAnimation({
+      name,
+      style: style as AnimationStyle,
+      palette,
+      speed: speed as AnimationSpeed | undefined,
+      direction: direction as AnimationDirection | undefined,
+      brightness,
+    });
+    return ok(`Animation "${name}" created and activated with ${colors.length} colors using ${style} style`);
+  } catch (e) {
+    return err(e);
+  }
+});
+
+server.registerTool("delete_animation", {
+  title: "Delete Animation",
+  description: "Delete a custom animation by name. Cannot delete built-in effects.",
+  inputSchema: z.object({
+    device: deviceParam,
+    name: z.string().describe('The name of the custom animation to delete. <example>"Ocean Waves"</example>'),
+  }),
+}, async ({ device, name }) => {
+  const resolved = resolveDevice(device);
+  if ("error" in resolved) return resolved.error;
+  try {
+    await resolved.client.deleteAnimation(name);
+    return ok(`Animation "${name}" deleted`);
   } catch (e) {
     return err(e);
   }
