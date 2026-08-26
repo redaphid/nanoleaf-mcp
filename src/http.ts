@@ -11,7 +11,7 @@ type ParseColor = (
 ) => { hue: number; saturation: number; brightness: number } | null;
 
 export async function startHttp(
-  server: McpServer,
+  createServer: () => McpServer,
   deviceManager: DeviceManager,
   parseColor: ParseColor,
   port: number,
@@ -38,6 +38,10 @@ export async function startHttp(
         transport.onclose = () => {
           if (transport.sessionId) delete transports[transport.sessionId];
         };
+        // One McpServer PER SESSION. The SDK's Protocol has a single `_transport`
+        // slot, so reconnecting a shared server here would orphan every earlier
+        // session's pending replies onto this new transport.
+        const server = createServer();
         await server.connect(transport);
         await transport.handleRequest(req, res, req.body);
       } else {

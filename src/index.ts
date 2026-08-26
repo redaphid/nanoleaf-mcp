@@ -82,11 +82,6 @@ const panelIdParam = (description: string) =>
 
 const deviceParam = z.string().optional().describe("Device alias or IP. Optional when only one device is registered.");
 
-const server = new McpServer({
-  name: "nanoleaf-mcp",
-  version: "2.1.0",
-});
-
 // Helper for tool responses
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
 const err = (error: any) => ({
@@ -100,6 +95,8 @@ function resolveDevice(device?: string) {
   if ("error" in result) return { error: ok(result.error) };
   return result;
 }
+
+const registerTools = (server: McpServer) => {
 
 // ============================================
 // DEVICE MANAGEMENT TOOLS
@@ -862,6 +859,27 @@ server.registerTool("test_connection", {
   }
 });
 
+};
+
+/**
+ * Build a fresh McpServer.
+ *
+ * MUST be called once per transport/session. The MCP SDK's `Protocol` holds a
+ * SINGLE `_transport` slot (`protocol.js`: `async connect(transport) { this._transport = transport; ... }`),
+ * and replies are routed through whatever is in that slot at send time. Sharing
+ * one McpServer across sessions therefore means every new `initialize` silently
+ * re-points the previous session's responses at the new session's transport, and
+ * the older session's requests hang forever with no error on either side.
+ */
+export const createServer = (): McpServer => {
+  const server = new McpServer({
+    name: "nanoleaf-mcp",
+    version: "2.1.0",
+  });
+  registerTools(server);
+  return server;
+};
+
 // ============================================
 // START
 // ============================================
@@ -874,10 +892,10 @@ async function main() {
 
   if (process.argv.includes("--stdio")) {
     const { startStdio } = await import("./stdio.ts");
-    await startStdio(server);
+    await startStdio(createServer());
   } else {
     const { startHttp } = await import("./http.ts");
-    await startHttp(server, deviceManager, parseColor, PORT);
+    await startHttp(createServer, deviceManager, parseColor, PORT);
   }
 }
 
